@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Web App: Phân bổ chi phí điện - GreenNode AgentBase
-API endpoints for processing PDF/Excel/Image and updating Excel
+Web App: AI Assistant - Phan bo chi phi
+Rules: I.1 Phan bo chi phi dien, I.2 Phan bo chi phi nuoc uong
 """
 import os
 import re
@@ -18,7 +18,6 @@ from pydantic import BaseModel
 import pdfplumber
 import openpyxl
 
-# Optional imports
 try:
     import pytesseract
     from PIL import Image
@@ -27,20 +26,47 @@ except ImportError:
     HAS_OCR = False
 
 # ==========================================
-# CONFIG
+# RULES CONFIG
 # ==========================================
-DATA_START_ROW = 5
-COL_CODE = 8
-COL_KY_TT = 13
-COL_KY_TT_TRUOC = 14
-COL_TONG_TIEN_DIEM = 15
-EXCEL_PREFIX = "Bảng phân bổ thanh toán chi phí điện"
-DEFAULT_DIR = "/data"
+RULES = {
+    "dien": {
+        "name": "Phan bo chi phi dien",
+        "data_start_row": 5,
+        "col_code": 8,
+        "col_fill": 15,
+        "sheet_index": 1,
+        "excel_prefix": "Bang phan bo thanh toan chi phi dien",
+        "title_format": "BANG PHAN BO CHI PHI THANG {month}/2026",
+        "sheet_format": "Phan bo_{month}.26",
+        "has_date_shift": True,
+        "col_ky_tt": 13,
+        "col_ky_tt_truoc": 14,
+        "split_duplicates": False,
+        "has_di_doi": True,
+        "ref_month": 7,
+    },
+    "nuoc": {
+        "name": "Phan bo chi phi nuoc uong",
+        "data_start_row": 5,
+        "col_code": 2,
+        "col_fill": 8,
+        "sheet_index": 2,
+        "excel_prefix": "Bang phan bo chi phi nuoc uong",
+        "title_format": "BANG PHAN BO CHI PHI NUOC UONG THANG {month}/2026",
+        "sheet_format": "T{month}",
+        "has_date_shift": False,
+        "col_ky_tt": 13,
+        "col_ky_tt_truoc": 14,
+        "split_duplicates": True,
+        "has_di_doi": False,
+        "ref_month": 7,
+    },
+}
 
 # ==========================================
 # APP
 # ==========================================
-app = FastAPI(title="Phân bổ chi phí điện", version="1.0")
+app = FastAPI(title="AI Assistant - Phan bo chi phi", version="2.0")
 
 @app.get("/health")
 async def health():
@@ -48,159 +74,211 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"app": "Phân bổ chi phí điện", "version": "1.0", "health": "/health", "docs": "/docs"}
+    return {
+        "app": "AI Assistant - Phan bo chi phi",
+        "version": "2.0",
+        "rules": list(RULES.keys()),
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "process": "/process (POST)",
+            "download": "/process/download (POST)",
+        }
+    }
 
 # ==========================================
-# LOGIC
+# HELPER FUNCTIONS
 # ==========================================
-
 def add_months(date_str, n):
     try:
         d = datetime.strptime(date_str.strip(), '%d/%m/%Y')
-        total_months = d.year * 12 + d.month - 1 + n
-        year = total_months // 12
-        month = total_months % 12 + 1
-        last_day = calendar.monthrange(year, month)[1]
-        day = min(d.day, last_day)
-        return d.replace(year=year, month=month, day=day).strftime('%d/%m/%Y')
+        total = d.year * 12 + d.month - 1 + n
+        y, m = total // 12, total % 12 + 1
+        return d.replace(year=y, month=m, day=min(d.day, calendar.monthrange(y, m)[1])).strftime('%d/%m/%Y')
     except:
         return None
 
-def shift_date_range(date_range_str, n):
-    if not date_range_str:
-        return None
-    match = re.match(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', str(date_range_str).strip())
-    if not match:
-        return None
-    s = add_months(match.group(1), n)
-    e = add_months(match.group(2), n)
-    if s and e:
-        return f"{s} - {e}"
-    return None
+def shift_date_range(s, n):
+    if not s: return None
+    m = re.match(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', str(s).strip())
+    if not m: return None
+    a, b = add_months(m.group(1), n), add_months(m.group(2), n)
+    return f"{a} - {b}" if a and b else None
 
-def _extract_code(text):
-    if not text:
-        return ""
-    text = str(text).strip()
-    m = re.match(r'^([A-Z]{2}[0-9A-Z]+)', text)
-    if not m:
-        m = re.search(r'\b([A-Z]{2}\d{8,})\b', text)
+def _code(text):
+    if not text: return ""
+    t = str(text).strip()
+    m = re.match(r'^([A-Z]{2}[0-9A-Z]+)', t) or re.search(r'\b([A-Z]{2}\d{8,})\b', t)
     return m.group(1) if m else ""
 
-def _extract_amount(debit, credit):
+def _amt(d, c):
     s = ""
-    if debit and debit != '0':
-        s = debit.replace(',', '').replace('.00', '').strip()
-    elif credit and credit != '0':
-        s = credit.replace(',', '').replace('.00', '').strip()
+    if d and d != '0': s = d.replace(',', '').replace('.00', '').strip()
+    elif c and c != '0': s = c.replace(',', '').replace('.00', '').strip()
     return float(s) if s else 0
 
-def extract_pdf_data(filepath):
+# ==========================================
+# DATA EXTRACTION
+# ==========================================
+def extract_pdf_dien(fp):
+    """Extract from electricity PDF (bank statement format)"""
     data = []
-    with pdfplumber.open(filepath) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables():
-                for row in table:
-                    if not row or not row[0]:
-                        continue
-                    stt = str(row[0]).strip() if row[0] else ""
-                    if not stt.isdigit():
-                        continue
-                    desc = str(row[5]).strip() if row[5] else ""
-                    debit = str(row[6]).strip() if row[6] else ""
-                    credit = str(row[7]).strip() if row[7] else ""
-                    code = _extract_code(desc)
-                    amount = _extract_amount(debit, credit)
-                    if code and code != 'MSB' and amount > 0:
-                        data.append({'code': code, 'amount': amount})
+    with pdfplumber.open(fp) as pdf:
+        for p in pdf.pages:
+            for t in p.extract_tables():
+                for r in t:
+                    if not r or not r[0]: continue
+                    if not str(r[0]).strip().isdigit(): continue
+                    code = _code(str(r[5]) if r[5] else "")
+                    amt = _amt(str(r[6]) if r[6] else "", str(r[7]) if r[7] else "")
+                    if code and code != 'MSB' and amt > 0:
+                        data.append({'code': code, 'amount': amt})
     return data
 
-def extract_excel_data(filepath):
+def extract_pdf_nuoc(fp):
+    """Extract from water PDF (sales detail format).
+    1. Find customer code (C\d+) in table col 0 -> take col 6 (So Luong = cot thu 7)
+    2. For codes split across pages -> get from 'Theo mat hang/By SKU:' text
+    3. If code not found -> left empty in Excel
+    """
+    result = {}
+    with pdfplumber.open(fp) as pdf:
+        all_text = ""
+        all_tables = []
+        for page in pdf.pages:
+            all_text += (page.extract_text() or "") + "\n"
+            for table in page.extract_tables():
+                all_tables.append(table)
+
+        # STEP 1: Find codes in table (col 0 = code, col 6 = So Luong)
+        for table in all_tables:
+            for row in table:
+                if not row or not row[0]: continue
+                m = re.match(r'^(C\d+)', str(row[0]).strip())
+                if not m: continue
+                code = m.group(1)
+                qty_str = str(row[6]).strip() if len(row) > 6 and row[6] else ""
+                try: qty = float(qty_str.replace(',', ''))
+                except: qty = 0
+                if qty > 0 and code not in result:
+                    result[code] = qty
+
+        # STEP 2: Codes split across pages -> 'Theo mat hang/By SKU:' fallback
+        lines = all_text.split('\n')
+        current_code = None
+        for i, line in enumerate(lines):
+            line = line.strip()
+            m = re.match(r'^(C\d+)', line)
+            if m: current_code = m.group(1)
+            if ('Theo mat hang' in line or 'By SKU' in line) and current_code:
+                if current_code not in result and i + 1 < len(lines):
+                    sku_line = lines[i + 1].strip()
+                    nums = re.findall(r'(\d[\d,]*)', sku_line)
+                    if nums:
+                        try:
+                            qty = float(nums[-1].replace(',', ''))
+                            if qty > 0: result[current_code] = qty
+                        except: pass
+
+    return [{'code': k, 'amount': v} for k, v in result.items()]
+
+def extract_excel_data(fp):
     data = []
-    wb = openpyxl.load_workbook(filepath, keep_vba=False, data_only=True)
+    wb = openpyxl.load_workbook(fp, keep_vba=False, data_only=True)
     for ws in wb.worksheets:
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=5, values_only=True):
-            if not row or not row[0]:
-                continue
-            code = str(row[0]).strip()
-            amount = 0
-            if len(row) > 2 and row[2]:
-                try:
-                    amount = float(str(row[2]).replace(',', '').replace('.00', '').strip())
-                except:
-                    pass
-            if code and amount > 0:
-                data.append({'code': code, 'amount': amount})
+        for r in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=5, values_only=True):
+            if not r or not r[0]: continue
+            code = str(r[0]).strip()
+            amt = 0
+            if len(r) > 2 and r[2]:
+                try: amt = float(str(r[2]).replace(',', '').replace('.00', '').strip())
+                except: pass
+            if code and amt > 0: data.append({'code': code, 'amount': amt})
     wb.close()
     return data
 
-def extract_image_data(filepath):
-    if not HAS_OCR:
-        raise HTTPException(status_code=500, detail="OCR not available. Install pytesseract.")
+def extract_image_data(fp):
+    if not HAS_OCR: raise HTTPException(status_code=500, detail="OCR not available")
     tess_path = os.environ.get('TESSERACT_CMD', '/usr/bin/tesseract')
     pytesseract.pytesseract.tesseract_cmd = tess_path
-    img = Image.open(filepath)
-    text = pytesseract.image_to_string(img, lang='eng')
+    text = pytesseract.image_to_string(Image.open(fp), lang='eng')
     data = []
     for line in text.split('\n'):
-        code = _extract_code(line)
+        code = _code(line)
         nums = re.findall(r'[\d,]+\.?\d*', line)
-        amount = float(nums[-1].replace(',', '')) if nums else 0
-        if code and code != 'MSB' and amount > 0:
-            data.append({'code': code, 'amount': amount})
+        amt = float(nums[-1].replace(',', '')) if nums else 0
+        if code and code != 'MSB' and amt > 0: data.append({'code': code, 'amount': amt})
     return data
 
 def build_lookup(data_list):
-    lookup = {}
+    lk = {}
     for item in data_list:
-        if item['code'] not in lookup:
-            lookup[item['code']] = item
-    return lookup
+        if item['code'] not in lk: lk[item['code']] = item
+    return lk
 
-def process_excel(excel_path, lookup, month_shift=0):
+# ==========================================
+# PROCESS EXCEL
+# ==========================================
+def process_excel(excel_path, lookup, rule_key, month_shift=0):
+    rule = RULES[rule_key]
     wb = openpyxl.load_workbook(excel_path, keep_vba=False)
-    ws = wb.worksheets[1]
+    ws = wb.worksheets[rule["sheet_index"]]
     results = []
     updated = skipped_dd = skipped_nm = 0
 
-    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        code = ws.cell(row=row_idx, column=COL_CODE).value
-        if not code:
-            continue
-        code = str(code).strip()
-        c13 = ws.cell(row=row_idx, column=COL_KY_TT).value or ""
-        c14 = ws.cell(row=row_idx, column=COL_KY_TT_TRUOC).value or ""
+    # Count code occurrences for split_duplicates
+    code_counts = {}
+    if rule["split_duplicates"]:
+        for ri in range(rule["data_start_row"], ws.max_row + 1):
+            c = ws.cell(row=ri, column=rule["col_code"]).value
+            if c: code_counts[str(c).strip()] = code_counts.get(str(c).strip(), 0) + 1
 
-        if any(kw in str(c13).lower() for kw in ['di d', 'dời', 'ngừng']) or \
-           any(kw in str(c14).lower() for kw in ['di d', 'dời', 'ngừng']):
-            ws.cell(row=row_idx, column=COL_TONG_TIEN_DIEM).value = None
-            skipped_dd += 1
-            results.append({'row': row_idx, 'code': code, 'action': 'SKIP', 'amount': 'blank'})
-            continue
+    for ri in range(rule["data_start_row"], ws.max_row + 1):
+        ec = ws.cell(row=ri, column=rule["col_code"]).value
+        if not ec: continue
+        ec = str(ec).strip()
 
-        if month_shift != 0:
-            n13 = shift_date_range(c13, month_shift)
-            if n13:
-                ws.cell(row=row_idx, column=COL_KY_TT).value = n13
-            n14 = shift_date_range(c14, month_shift)
-            if n14:
-                ws.cell(row=row_idx, column=COL_KY_TT_TRUOC).value = n14
+        # Check di dời
+        if rule["has_di_doi"]:
+            c13 = ws.cell(row=ri, column=rule["col_ky_tt"]).value or ""
+            c14 = ws.cell(row=ri, column=rule["col_ky_tt_truoc"]).value or ""
+            if any(k in str(c13).lower() for k in ['di d', 'dời', 'ngừng']) or \
+               any(k in str(c14).lower() for k in ['di d', 'dời', 'ngừng']):
+                ws.cell(row=ri, column=rule["col_fill"]).value = None
+                skipped_dd += 1
+                results.append({'row': ri, 'code': ec, 'action': 'SKIP', 'amount': 'blank'})
+                continue
+            if month_shift and rule["has_date_shift"]:
+                n13 = shift_date_range(c13, month_shift)
+                if n13: ws.cell(row=ri, column=rule["col_ky_tt"]).value = n13
+                n14 = shift_date_range(c14, month_shift)
+                if n14: ws.cell(row=ri, column=rule["col_ky_tt_truoc"]).value = n14
 
-        if code in lookup:
-            ws.cell(row=row_idx, column=COL_TONG_TIEN_DIEM).value = lookup[code]['amount']
+        if ec in lookup:
+            a = lookup[ec]['amount']
+            if rule["split_duplicates"] and code_counts.get(ec, 1) > 1:
+                a = a / code_counts[ec]
+            ws.cell(row=ri, column=rule["col_fill"]).value = a
             updated += 1
-            results.append({'row': row_idx, 'code': code, 'action': 'UPDATED', 'amount': lookup[code]['amount']})
+            results.append({'row': ri, 'code': ec, 'action': 'UPDATED', 'amount': a})
         else:
+            # Not found -> leave empty
+            ws.cell(row=ri, column=rule["col_fill"]).value = None
             skipped_nm += 1
-            results.append({'row': row_idx, 'code': code, 'action': 'NO_MATCH', 'amount': 0})
+            results.append({'row': ri, 'code': ec, 'action': 'NO_MATCH', 'amount': 0})
+
+    # Update title and sheet name
+    month_num = str(7 + month_shift).zfill(2)
+    ws.cell(row=3, column=1).value = rule["title_format"].format(month=month_num)
+    ws.title = rule["sheet_format"].format(month=month_num)
 
     return wb, results, updated, skipped_dd, skipped_nm
 
 # ==========================================
 # API ENDPOINTS
 # ==========================================
-
 class ProcessResponse(BaseModel):
+    rule: str
     updated: int
     skipped_di_doi: int
     no_match: int
@@ -209,26 +287,33 @@ class ProcessResponse(BaseModel):
 
 @app.post("/process", response_model=ProcessResponse)
 async def process(
+    rule: str = Form(...),
+    month: int = Form(...),
     input_file: UploadFile = File(...),
     excel_template: UploadFile = File(...),
-    month: int = Form(...),
 ):
-    """Process input file (PDF/Excel/Image) and update Excel template."""
-    # Save uploaded files to temp
+    """Process input file and update Excel template.
+    rule: 'dien' or 'nuoc'
+    month: input month number (e.g., 6, 7, 9)
+    """
+    if rule not in RULES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}. Use 'dien' or 'nuoc'")
+
     tmpdir = tempfile.mkdtemp()
     try:
+        # Save uploaded files
         input_path = os.path.join(tmpdir, input_file.filename)
-        with open(input_path, 'wb') as f:
-            f.write(await input_file.read())
-
+        with open(input_path, 'wb') as f: f.write(await input_file.read())
         excel_path = os.path.join(tmpdir, excel_template.filename)
-        with open(excel_path, 'wb') as f:
-            f.write(await excel_template.read())
+        with open(excel_path, 'wb') as f: f.write(await excel_template.read())
 
-        # Extract data based on file type
+        # Extract data based on file type and rule
         ext = os.path.splitext(input_file.filename)[1].lower()
         if ext == '.pdf':
-            data = extract_pdf_data(input_path)
+            if rule == 'nuoc':
+                data = extract_pdf_nuoc(input_path)
+            else:
+                data = extract_pdf_dien(input_path)
         elif ext in ('.xlsx', '.xls'):
             data = extract_excel_data(input_path)
         elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
@@ -237,22 +322,18 @@ async def process(
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
 
         lookup = build_lookup(data)
-        month_shift = month - 7
-        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, month_shift)
-
-        # Update title
-        month_num = str(month).zfill(2)
-        ws = wb.worksheets[1]
-        ws.cell(row=3, column=1).value = f"BẢNG PHÂN BỔ CHI PHÍ THÁNG {month_num}/2026"
-        ws.title = f"Phân bổ_{month_num}.26"
+        month_shift = month - RULES[rule]["ref_month"]
+        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, rule, month_shift)
 
         # Save output
-        output_name = f"{EXCEL_PREFIX} tháng {month}.2026.xlsx"
+        rule_cfg = RULES[rule]
+        output_name = f"{rule_cfg['excel_prefix']} thang {month}.2026.xlsx"
         output_path = os.path.join(tmpdir, output_name)
         wb.save(output_path)
         wb.close()
 
         return ProcessResponse(
+            rule=rule,
             updated=updated,
             skipped_di_doi=skipped_dd,
             no_match=skipped_nm,
@@ -264,24 +345,25 @@ async def process(
 
 @app.post("/process/download")
 async def process_download(
+    rule: str = Form(...),
+    month: int = Form(...),
     input_file: UploadFile = File(...),
     excel_template: UploadFile = File(...),
-    month: int = Form(...),
 ):
     """Process and return the updated Excel file for download."""
+    if rule not in RULES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}")
+
     tmpdir = tempfile.mkdtemp()
     try:
         input_path = os.path.join(tmpdir, input_file.filename)
-        with open(input_path, 'wb') as f:
-            f.write(await input_file.read())
-
+        with open(input_path, 'wb') as f: f.write(await input_file.read())
         excel_path = os.path.join(tmpdir, excel_template.filename)
-        with open(excel_path, 'wb') as f:
-            f.write(await excel_template.read())
+        with open(excel_path, 'wb') as f: f.write(await excel_template.read())
 
         ext = os.path.splitext(input_file.filename)[1].lower()
         if ext == '.pdf':
-            data = extract_pdf_data(input_path)
+            data = extract_pdf_nuoc(input_path) if rule == 'nuoc' else extract_pdf_dien(input_path)
         elif ext in ('.xlsx', '.xls'):
             data = extract_excel_data(input_path)
         elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
@@ -290,15 +372,11 @@ async def process_download(
             raise HTTPException(status_code=400, detail=f"Unsupported: {ext}")
 
         lookup = build_lookup(data)
-        month_shift = month - 7
-        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, month_shift)
+        month_shift = month - RULES[rule]["ref_month"]
+        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, rule, month_shift)
 
-        month_num = str(month).zfill(2)
-        ws = wb.worksheets[1]
-        ws.cell(row=3, column=1).value = f"BẢNG PHÂN BỔ CHI PHÍ THÁNG {month_num}/2026"
-        ws.title = f"Phân bổ_{month_num}.26"
-
-        output_name = f"{EXCEL_PREFIX} tháng {month}.2026.xlsx"
+        rule_cfg = RULES[rule]
+        output_name = f"{rule_cfg['excel_prefix']} thang {month}.2026.xlsx"
         output_path = os.path.join(tmpdir, output_name)
         wb.save(output_path)
         wb.close()
