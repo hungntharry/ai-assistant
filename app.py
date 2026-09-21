@@ -54,7 +54,8 @@ RULES = {
         "col_fill": 15,
         "sheet_index": 1,
         "excel_prefix": "Bang phan bo thanh toan chi phi dien",
-        "title_format": "BANG PHAN BO CHI PHI THANG {month}/2026",
+        "output_format": "Bảng phân bổ chi phí điện tháng {month} năm {year}",
+        "title_format": "BẢNG PHÂN BỔ CHI PHÍ THÁNG {month}/{year}",
         "sheet_format": "Phan bo_{month}.26",
         "has_date_shift": True,
         "col_ky_tt": 13,
@@ -74,7 +75,8 @@ RULES = {
         "col_fill": 8,
         "sheet_index": 2,
         "excel_prefix": "Bang phan bo chi phi nuoc uong",
-        "title_format": "BANG PHAN BO CHI PHI NUOC UONG THANG {month}/2026",
+        "output_format": "Bảng phân bổ chi phí nước uống tháng {month} năm {year}",
+        "title_format": "BẢNG PHÂN BỔ CHI PHÍ NƯỚC UỐNG THÁNG {month}/{year}",
         "sheet_format": "T{month}",
         "has_date_shift": False,
         "col_ky_tt": 13,
@@ -344,7 +346,7 @@ def build_lk(data):
         if i['code'] not in lk: lk[i['code']] = i
     return lk
 
-def process_xl(ep, lk, r, ms=0):
+def process_xl(ep, lk, r, ms=0, year="2026"):
     wb = openpyxl.load_workbook(ep, keep_vba=False)
     ws = wb.worksheets[r["sheet_index"]]
     res = []; u = sd = sn = 0; cc = {}
@@ -381,11 +383,10 @@ def process_xl(ep, lk, r, ms=0):
         else:
             cell.value = 0; sn += 1
             res.append({'row': ri, 'code': ec, 'action': 'NO MATCH', 'amount': '0'})
-    # Update title
-    if ms != 0:
-        mn = str(r["ref_month"] + ms).zfill(2)
-        ws.cell(row=3, column=1).value = r["title_format"].format(month=mn)
-        ws.title = r["sheet_format"].format(month=mn)
+    # Always update title and sheet name to match input month
+    mn = str(r["ref_month"] + ms).zfill(2)
+    ws.cell(row=3, column=1).value = r["title_format"].format(month=mn, year=year)
+    ws.title = r["sheet_format"].format(month=mn)
     return wb, res, u, sd, sn
 
 def doi_soat(ep, lk, ds_cfg):
@@ -432,11 +433,14 @@ def doi_soat(ep, lk, ds_cfg):
 
 def get_out(ip, bd, r):
     bn = os.path.basename(ip[0])
-    m = re.search(r'(?:thang|thang|T)\s*(\d+)', bn, re.IGNORECASE)
+    # Match "tháng X năm YYYY" or "tháng X.YYYY" or "tháng X YYYY"
+    m = re.search(r'(?:tháng|thang)\s*(\d+)[.\s]*(?:năm\s*)?(\d{4})?', bn, re.IGNORECASE)
     if m:
         ms = m.group(1)
-        return os.path.join(bd, f"{r['excel_prefix']} thang {ms}.xlsx"), ms
-    return None, None
+        year = m.group(2) if m.group(2) else "2026"
+        output_name = r.get("output_format", "Ket qua phan bo tháng {month} năm {year}").format(month=ms, year=year) + ".xlsx"
+        return os.path.join(bd, output_name), ms, year
+    return None, None, None
 
 def load_set():
     try:
@@ -731,14 +735,19 @@ class App:
                     else: data.extend(extract_pdf(p))
                 elif e in ('.xlsx','.xls'): data.extend(extract_xl(p))
                 elif e in ('.jpg','.jpeg','.png','.gif'): data.extend(extract_img(p))
-            lk = build_lk(data); ms = 0
+            lk = build_lk(data); ms = 0; year = "2026"
             if self.input_paths:
                 bn = os.path.basename(self.input_paths[0])
-                m = re.search(r'(?:thang|thang|T)\s*(\d+)', bn, re.IGNORECASE)
-                if m: ms = int(m.group(1)) - r["ref_month"]
-            self.wb, self.results, u, sd, sn = process_xl(self.excel_path, lk, r, ms)
-            self.output_path, mstr = get_out(self.input_paths, os.path.dirname(self.excel_path), r)
-            if not self.output_path: self.output_path = self.excel_path
+                m = re.search(r'(?:tháng|thang)\s*(\d+)[.\s]*(?:năm\s*)?(\d{4})?', bn, re.IGNORECASE)
+                if m:
+                    ms = int(m.group(1)) - r["ref_month"]
+                    if m.group(2): year = m.group(2)
+            self.wb, self.results, u, sd, sn = process_xl(self.excel_path, lk, r, ms, year)
+            self.output_path, mstr, out_year = get_out(self.input_paths, os.path.dirname(self.excel_path), r)
+            # NEVER save to file gốc - always use a different output file
+            if not self.output_path or self.output_path == self.excel_path:
+                default_name = r.get("output_format", "Ket qua phan bo").format(month="X", year="2026") + ".xlsx"
+                self.output_path = os.path.join(os.path.dirname(self.excel_path), default_name)
             self.tree.delete(*self.tree.get_children())
             for x in self.results:
                 t = 'updated' if x['action']=='UPDATED' else ('skip' if 'SKIP' in x['action'] or 'KEEP' in x['action'] else 'nomatch')
@@ -1043,6 +1052,10 @@ class App:
 
     def _save(self):
         if not self.wb or not self.output_path: return
+        # NEVER save to file gốc
+        if self.output_path == self.excel_path:
+            messagebox.showerror("Loi", "Khong the luu vao file goc!")
+            return
         try:
             bp = self.output_path.replace('.xlsx', '_backup.xlsx')
             if os.path.exists(self.output_path): shutil.copy2(self.output_path, bp)
