@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Web App: AI Assistant - Phan bo chi phi
-Rules: I.1 Phan bo chi phi dien, I.2 Phan bo chi phi nuoc uong
+Web App: AI Assistant - Phan bo chi phi + Doi soat du lieu
+I. Doi soat du lieu (dien, nuoc uong)
+II. Phan bo chi phi (dien, nuoc uong)
 """
 import os
 import re
@@ -26,7 +27,7 @@ except ImportError:
     HAS_OCR = False
 
 # ==========================================
-# RULES CONFIG
+# CONFIG
 # ==========================================
 RULES = {
     "dien": {
@@ -66,7 +67,7 @@ RULES = {
 # ==========================================
 # APP
 # ==========================================
-app = FastAPI(title="AI Assistant - Phan bo chi phi", version="2.0")
+app = FastAPI(title="AI Assistant - Phan bo + Doi soat", version="3.0")
 
 @app.get("/health")
 async def health():
@@ -75,14 +76,17 @@ async def health():
 @app.get("/")
 async def root():
     return {
-        "app": "AI Assistant - Phan bo chi phi",
-        "version": "2.0",
-        "rules": list(RULES.keys()),
+        "app": "AI Assistant",
+        "version": "3.0",
+        "menu": {
+            "I": "Doi soat du lieu",
+            "II": "Phan bo chi phi",
+        },
         "endpoints": {
             "health": "/health",
             "docs": "/docs",
-            "process": "/process (POST)",
-            "download": "/process/download (POST)",
+            "phan-bo": "/phan-bo (POST)",
+            "doi-soat": "/doi-soat (POST)",
         }
     }
 
@@ -121,7 +125,6 @@ def _amt(d, c):
 # DATA EXTRACTION
 # ==========================================
 def extract_pdf_dien(fp):
-    """Extract from electricity PDF (bank statement format)"""
     data = []
     with pdfplumber.open(fp) as pdf:
         for p in pdf.pages:
@@ -136,11 +139,6 @@ def extract_pdf_dien(fp):
     return data
 
 def extract_pdf_nuoc(fp):
-    """Extract from water PDF (sales detail format).
-    1. Find customer code (C\d+) in table col 0 -> take col 6 (So Luong = cot thu 7)
-    2. For codes split across pages -> get from 'Theo mat hang/By SKU:' text
-    3. If code not found -> left empty in Excel
-    """
     result = {}
     with pdfplumber.open(fp) as pdf:
         all_text = ""
@@ -149,8 +147,6 @@ def extract_pdf_nuoc(fp):
             all_text += (page.extract_text() or "") + "\n"
             for table in page.extract_tables():
                 all_tables.append(table)
-
-        # STEP 1: Find codes in table (col 0 = code, col 6 = So Luong)
         for table in all_tables:
             for row in table:
                 if not row or not row[0]: continue
@@ -160,10 +156,7 @@ def extract_pdf_nuoc(fp):
                 qty_str = str(row[6]).strip() if len(row) > 6 and row[6] else ""
                 try: qty = float(qty_str.replace(',', ''))
                 except: qty = 0
-                if qty > 0 and code not in result:
-                    result[code] = qty
-
-        # STEP 2: Codes split across pages -> 'Theo mat hang/By SKU:' fallback
+                if qty > 0 and code not in result: result[code] = qty
         lines = all_text.split('\n')
         current_code = None
         for i, line in enumerate(lines):
@@ -179,7 +172,61 @@ def extract_pdf_nuoc(fp):
                             qty = float(nums[-1].replace(',', ''))
                             if qty > 0: result[current_code] = qty
                         except: pass
+    return [{'code': k, 'amount': v} for k, v in result.items()]
 
+def extract_pdf_nuoc_by_pgh(fp):
+    """Extract So PGH (9-digit) -> quantity from water PDF"""
+    result = {}
+    with pdfplumber.open(fp) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            if 'PHIẾU GIAO HÀNG' in text or 'DELIVERY TICKET' in text:
+                m = re.search(r'SỐ PHIẾU[/\s]*NO[\.\s]*\s*(\d{9})', text)
+                if not m:
+                    m = re.search(r'NO\.\s*(\d{9})', text)
+                if not m:
+                    lines = text.split('\n')
+                    for i, line in enumerate(lines):
+                        if 'SỐ PHIẾU' in line or 'NO.' in line:
+                            for j in range(i, min(i + 4, len(lines))):
+                                nums = re.findall(r'\d{9}', lines[j])
+                                if nums:
+                                    m = re.match(r'(\d{9})', nums[0])
+                                    break
+                            if m: break
+                if m:
+                    pgh = m.group(1) if m else ""
+                    tables = page.extract_tables()
+                    qty = 0
+                    for table in tables:
+                        if len(table) >= 2:
+                            header = table[0]
+                            row1 = table[1]
+                            qty_col = -1
+                            for ci, h in enumerate(header):
+                                if h and 'lượng' in str(h).lower():
+                                    qty_col = ci
+                                    break
+                            if qty_col >= 0 and len(row1) > qty_col and row1[qty_col]:
+                                try: qty = float(str(row1[qty_col]).replace(',', ''))
+                                except: qty = 0
+                            break
+                    if pgh and qty > 0 and pgh not in result:
+                        result[pgh] = qty
+            else:
+                for table in page.extract_tables():
+                    for row in table:
+                        if not row: continue
+                        col1 = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                        col2 = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+                        col6 = str(row[6]).strip() if len(row) > 6 and row[6] else ""
+                        if re.match(r'\d{2}/\d{2}/\d{4}', col1):
+                            m = re.search(r'\d{9}', col2)
+                            if m:
+                                pgh = m.group(0)
+                                try: qty = float(col6.replace(',', ''))
+                                except: qty = 0
+                                if pgh not in result: result[pgh] = qty
     return [{'code': k, 'amount': v} for k, v in result.items()]
 
 def extract_excel_data(fp):
@@ -196,6 +243,25 @@ def extract_excel_data(fp):
             if code and amt > 0: data.append({'code': code, 'amount': amt})
     wb.close()
     return data
+
+def extract_xl_by_pgh(fp):
+    """Extract So PGH -> quantity from Excel. Col E=PGH, Col P=qty"""
+    result = {}
+    wb = openpyxl.load_workbook(fp, keep_vba=False, data_only=True)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+            if not row: continue
+            pgh_val = row[4] if len(row) > 4 else None
+            qty_val = row[15] if len(row) > 15 else None
+            if pgh_val:
+                m = re.search(r'\d{9}', str(pgh_val))
+                if m and qty_val:
+                    pgh = m.group(0)
+                    try: qty = float(str(qty_val).replace(',', ''))
+                    except: qty = 0
+                    if qty > 0 and pgh not in result: result[pgh] = qty
+    wb.close()
+    return [{'code': k, 'amount': v} for k, v in result.items()]
 
 def extract_image_data(fp):
     if not HAS_OCR: raise HTTPException(status_code=500, detail="OCR not available")
@@ -217,16 +283,15 @@ def build_lookup(data_list):
     return lk
 
 # ==========================================
-# PROCESS EXCEL
+# PHAN BO CHI PHI
 # ==========================================
-def process_excel(excel_path, lookup, rule_key, month_shift=0):
+def process_phan_bo(excel_path, lookup, rule_key, month_shift=0):
     rule = RULES[rule_key]
     wb = openpyxl.load_workbook(excel_path, keep_vba=False)
     ws = wb.worksheets[rule["sheet_index"]]
     results = []
     updated = skipped_dd = skipped_nm = 0
-
-    # Count code occurrences for split_duplicates
+    merged_ranges = list(ws.merged_cells.ranges)
     code_counts = {}
     if rule["split_duplicates"]:
         for ri in range(rule["data_start_row"], ws.max_row + 1):
@@ -235,49 +300,117 @@ def process_excel(excel_path, lookup, rule_key, month_shift=0):
 
     for ri in range(rule["data_start_row"], ws.max_row + 1):
         ec = ws.cell(row=ri, column=rule["col_code"]).value
-        if not ec: continue
+        if not ec or not str(ec).strip(): continue
         ec = str(ec).strip()
-
-        # Check di dời
+        if "HO HCM" in ec.upper():
+            results.append({'row': ri, 'code': ec, 'action': 'KEEP FORMULA', 'amount': '(HO HCM)'})
+            continue
+        cell = ws.cell(row=ri, column=rule["col_fill"])
+        if any(cell.coordinate in mr for mr in merged_ranges): continue
         if rule["has_di_doi"]:
             c13 = ws.cell(row=ri, column=rule["col_ky_tt"]).value or ""
             c14 = ws.cell(row=ri, column=rule["col_ky_tt_truoc"]).value or ""
             if any(k in str(c13).lower() for k in ['di d', 'dời', 'ngừng']) or \
                any(k in str(c14).lower() for k in ['di d', 'dời', 'ngừng']):
-                ws.cell(row=ri, column=rule["col_fill"]).value = None
-                skipped_dd += 1
-                results.append({'row': ri, 'code': ec, 'action': 'SKIP', 'amount': 'blank'})
-                continue
+                cell.value = None; skipped_dd += 1
+                results.append({'row': ri, 'code': ec, 'action': 'SKIP', 'amount': 'blank'}); continue
             if month_shift and rule["has_date_shift"]:
                 n13 = shift_date_range(c13, month_shift)
                 if n13: ws.cell(row=ri, column=rule["col_ky_tt"]).value = n13
                 n14 = shift_date_range(c14, month_shift)
                 if n14: ws.cell(row=ri, column=rule["col_ky_tt_truoc"]).value = n14
-
         if ec in lookup:
             a = lookup[ec]['amount']
-            if rule["split_duplicates"] and code_counts.get(ec, 1) > 1:
-                a = a / code_counts[ec]
-            ws.cell(row=ri, column=rule["col_fill"]).value = a
-            updated += 1
+            if rule["split_duplicates"] and code_counts.get(ec, 1) > 1: a = a / code_counts[ec]
+            cell.value = a; updated += 1
             results.append({'row': ri, 'code': ec, 'action': 'UPDATED', 'amount': a})
         else:
-            # Not found -> leave empty
-            ws.cell(row=ri, column=rule["col_fill"]).value = None
-            skipped_nm += 1
-            results.append({'row': ri, 'code': ec, 'action': 'NO_MATCH', 'amount': 0})
-
-    # Update title and sheet name
-    month_num = str(7 + month_shift).zfill(2)
-    ws.cell(row=3, column=1).value = rule["title_format"].format(month=month_num)
-    ws.title = rule["sheet_format"].format(month=month_num)
-
+            cell.value = 0; skipped_nm += 1
+            results.append({'row': ri, 'code': ec, 'action': 'NO MATCH', 'amount': 0})
+    if month_shift != 0:
+        mn = str(rule["ref_month"] + month_shift).zfill(2)
+        ws.cell(row=3, column=1).value = rule["title_format"].format(month=mn)
+        ws.title = rule["sheet_format"].format(month=mn)
     return wb, results, updated, skipped_dd, skipped_nm
+
+# ==========================================
+# DOI SOAT DU LIEU
+# ==========================================
+def process_doi_soat(file1_path, file2_path, rule_key):
+    """Compare 2 files by So PGH (9-digit). Returns pgh_result dict."""
+    ext1 = os.path.splitext(file1_path)[1].lower()
+    ext2 = os.path.splitext(file2_path)[1].lower()
+
+    # Extract by PGH from both files
+    data1, data2 = [], []
+    for fp, data_list in [(file1_path, 'data1'), (file2_path, 'data2')]:
+        ext = os.path.splitext(fp)[1].lower()
+        if ext == '.pdf':
+            if rule_key == 'nuoc':
+                d = extract_pdf_nuoc_by_pgh(fp)
+            else:
+                d = extract_pdf_dien(fp)
+        elif ext in ('.xlsx', '.xls'):
+            d = extract_xl_by_pgh(fp)
+        elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
+            d = extract_image_data(fp)
+        else:
+            d = []
+        if data_list == 'data1':
+            data1 = d
+        else:
+            data2 = d
+
+    lk1 = build_lk(data1)
+    lk2 = build_lk(data2)
+
+    pgh_result = {}
+    for pgh in set(list(lk1.keys()) + list(lk2.keys())):
+        q1 = lk1.get(pgh, {}).get('amount', None)
+        q2 = lk2.get(pgh, {}).get('amount', None)
+        if q1 is not None and q2 is not None:
+            pgh_result[pgh] = 'Đúng' if abs(q1 - q2) < 1 else 'Sai'
+        elif q1 is not None and q2 is None:
+            pgh_result[pgh] = 'Không có kết quả'
+        elif q2 is not None and q1 is None:
+            pgh_result[pgh] = 'Không có kết quả'
+
+    return pgh_result, len(data1), len(data2)
+
+def save_doi_soat_excel(excel_path, pgh_result):
+    """Save doi soat results to Excel - add result column, scan col E for PGH"""
+    wb = openpyxl.load_workbook(excel_path, keep_vba=False)
+    ws = wb.active
+    max_col = ws.max_column
+    result_col = max_col + 1
+    ws.cell(row=1, column=result_col).value = "Kết quả đối soát"
+    ws.cell(row=1, column=result_col).font = openpyxl.styles.Font(bold=True)
+
+    written = 0
+    for row_idx in range(2, ws.max_row + 1):
+        pgh_val = ws.cell(row=row_idx, column=5).value  # Column E
+        if pgh_val:
+            m = re.search(r'\d{9}', str(pgh_val))
+            if m:
+                pgh = m.group(0)
+                result = pgh_result.get(pgh, 'Không có kết quả')
+                cell = ws.cell(row=row_idx, column=result_col)
+                cell.value = result
+                if result == 'Đúng':
+                    cell.font = openpyxl.styles.Font(color='008000', bold=True)
+                elif result == 'Sai':
+                    cell.font = openpyxl.styles.Font(color='FF0000', bold=True)
+                else:
+                    cell.font = openpyxl.styles.Font(color='808080')
+                cell.alignment = openpyxl.styles.Alignment(horizontal='center')
+                written += 1
+
+    return wb, written, result_col
 
 # ==========================================
 # API ENDPOINTS
 # ==========================================
-class ProcessResponse(BaseModel):
+class PhanBoResponse(BaseModel):
     rule: str
     updated: int
     skipped_di_doi: int
@@ -285,72 +418,23 @@ class ProcessResponse(BaseModel):
     total: int
     results: list
 
-@app.post("/process", response_model=ProcessResponse)
-async def process(
+class DoiSoatResponse(BaseModel):
+    rule: str
+    file1_count: int
+    file2_count: int
+    matched: int
+    mismatched: int
+    no_result: int
+    total: int
+
+@app.post("/phan-bo", response_model=PhanBoResponse)
+async def phan_bo(
     rule: str = Form(...),
     month: int = Form(...),
     input_file: UploadFile = File(...),
     excel_template: UploadFile = File(...),
 ):
-    """Process input file and update Excel template.
-    rule: 'dien' or 'nuoc'
-    month: input month number (e.g., 6, 7, 9)
-    """
-    if rule not in RULES:
-        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}. Use 'dien' or 'nuoc'")
-
-    tmpdir = tempfile.mkdtemp()
-    try:
-        # Save uploaded files
-        input_path = os.path.join(tmpdir, input_file.filename)
-        with open(input_path, 'wb') as f: f.write(await input_file.read())
-        excel_path = os.path.join(tmpdir, excel_template.filename)
-        with open(excel_path, 'wb') as f: f.write(await excel_template.read())
-
-        # Extract data based on file type and rule
-        ext = os.path.splitext(input_file.filename)[1].lower()
-        if ext == '.pdf':
-            if rule == 'nuoc':
-                data = extract_pdf_nuoc(input_path)
-            else:
-                data = extract_pdf_dien(input_path)
-        elif ext in ('.xlsx', '.xls'):
-            data = extract_excel_data(input_path)
-        elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
-            data = extract_image_data(input_path)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
-
-        lookup = build_lookup(data)
-        month_shift = month - RULES[rule]["ref_month"]
-        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, rule, month_shift)
-
-        # Save output
-        rule_cfg = RULES[rule]
-        output_name = f"{rule_cfg['excel_prefix']} thang {month}.2026.xlsx"
-        output_path = os.path.join(tmpdir, output_name)
-        wb.save(output_path)
-        wb.close()
-
-        return ProcessResponse(
-            rule=rule,
-            updated=updated,
-            skipped_di_doi=skipped_dd,
-            no_match=skipped_nm,
-            total=updated + skipped_dd + skipped_nm,
-            results=results[:50],
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-@app.post("/process/download")
-async def process_download(
-    rule: str = Form(...),
-    month: int = Form(...),
-    input_file: UploadFile = File(...),
-    excel_template: UploadFile = File(...),
-):
-    """Process and return the updated Excel file for download."""
+    """Phan bo chi phi - update Excel template with input data."""
     if rule not in RULES:
         raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}")
 
@@ -373,10 +457,142 @@ async def process_download(
 
         lookup = build_lookup(data)
         month_shift = month - RULES[rule]["ref_month"]
-        wb, results, updated, skipped_dd, skipped_nm = process_excel(excel_path, lookup, rule, month_shift)
+        wb, results, updated, skipped_dd, skipped_nm = process_phan_bo(excel_path, lookup, rule, month_shift)
 
         rule_cfg = RULES[rule]
         output_name = f"{rule_cfg['excel_prefix']} thang {month}.2026.xlsx"
+        output_path = os.path.join(tmpdir, output_name)
+        wb.save(output_path)
+        wb.close()
+
+        return PhanBoResponse(
+            rule=rule, updated=updated, skipped_di_doi=skipped_dd,
+            no_match=skipped_nm, total=updated+skipped_dd+skipped_nm,
+            results=results[:50],
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@app.post("/phan-bo/download")
+async def phan_bo_download(
+    rule: str = Form(...),
+    month: int = Form(...),
+    input_file: UploadFile = File(...),
+    excel_template: UploadFile = File(...),
+):
+    """Phan bo - return updated Excel file."""
+    if rule not in RULES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}")
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        input_path = os.path.join(tmpdir, input_file.filename)
+        with open(input_path, 'wb') as f: f.write(await input_file.read())
+        excel_path = os.path.join(tmpdir, excel_template.filename)
+        with open(excel_path, 'wb') as f: f.write(await excel_template.read())
+
+        ext = os.path.splitext(input_file.filename)[1].lower()
+        if ext == '.pdf':
+            data = extract_pdf_nuoc(input_path) if rule == 'nuoc' else extract_pdf_dien(input_path)
+        elif ext in ('.xlsx', '.xls'):
+            data = extract_excel_data(input_path)
+        elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
+            data = extract_image_data(input_path)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported: {ext}")
+
+        lookup = build_lookup(data)
+        month_shift = month - RULES[rule]["ref_month"]
+        wb, results, updated, skipped_dd, skipped_nm = process_phan_bo(excel_path, lookup, rule, month_shift)
+
+        rule_cfg = RULES[rule]
+        output_name = f"{rule_cfg['excel_prefix']} thang {month}.2026.xlsx"
+        output_path = os.path.join(tmpdir, output_name)
+        wb.save(output_path)
+        wb.close()
+
+        return FileResponse(output_path, filename=output_name,
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@app.post("/doi-soat", response_model=DoiSoatResponse)
+async def doi_soat(
+    rule: str = Form(...),
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
+):
+    """Doi soat du lieu - compare 2 files by So PGH."""
+    if rule not in RULES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}")
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        f1_path = os.path.join(tmpdir, file1.filename)
+        with open(f1_path, 'wb') as f: f.write(await file1.read())
+        f2_path = os.path.join(tmpdir, file2.filename)
+        with open(f2_path, 'wb') as f: f.write(await file2.read())
+
+        pgh_result, count1, count2 = process_doi_soat(f1_path, f2_path, rule)
+
+        matched = sum(1 for v in pgh_result.values() if v == 'Đúng')
+        mismatched = sum(1 for v in pgh_result.values() if v == 'Sai')
+        no_result = sum(1 for v in pgh_result.values() if v == 'Không có kết quả')
+
+        return DoiSoatResponse(
+            rule=rule, file1_count=count1, file2_count=count2,
+            matched=matched, mismatched=mismatched, no_result=no_result,
+            total=len(pgh_result),
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@app.post("/doi-soat/download")
+async def doi_soat_download(
+    rule: str = Form(...),
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
+):
+    """Doi soat - return Excel with results. If file1 or file2 is Excel, use that format."""
+    if rule not in RULES:
+        raise HTTPException(status_code=400, detail=f"Invalid rule: {rule}")
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        f1_path = os.path.join(tmpdir, file1.filename)
+        with open(f1_path, 'wb') as f: f.write(await file1.read())
+        f2_path = os.path.join(tmpdir, file2.filename)
+        with open(f2_path, 'wb') as f: f.write(await file2.read())
+
+        pgh_result, count1, count2 = process_doi_soat(f1_path, f2_path, rule)
+
+        # Check if either file is Excel
+        ext1 = os.path.splitext(f1_path)[1].lower()
+        ext2 = os.path.splitext(f2_path)[1].lower()
+        excel_file = None
+        if ext1 in ('.xlsx', '.xls'):
+            excel_file = f1_path
+        elif ext2 in ('.xlsx', '.xls'):
+            excel_file = f2_path
+
+        if excel_file:
+            wb, written, result_col = save_doi_soat_excel(excel_file, pgh_result)
+            base_name = os.path.splitext(os.path.basename(excel_file))[0]
+            output_name = f"Doi soat {base_name}.xlsx"
+        else:
+            # PDF vs PDF - create new Excel
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Doi soat"
+            ws.cell(row=1, column=1).value = "Số PGH"
+            ws.cell(row=1, column=2).value = "Kết quả"
+            ws.cell(row=1, column=1).font = openpyxl.styles.Font(bold=True)
+            ws.cell(row=1, column=2).font = openpyxl.styles.Font(bold=True)
+            for ri, (pgh, result) in enumerate(sorted(pgh_result.items()), 2):
+                ws.cell(row=ri, column=1).value = pgh
+                ws.cell(row=ri, column=2).value = result
+            output_name = "Doi soat.xlsx"
+
         output_path = os.path.join(tmpdir, output_name)
         wb.save(output_path)
         wb.close()
